@@ -1799,7 +1799,7 @@ impl AssociationInternal {
         beginning_fragment: bool,
         unordered: bool,
     ) -> Option<ChunkPayloadData> {
-        if let Some(mut c) = self.pending_queue.pop(beginning_fragment, unordered).await {
+        if let Some(mut c) = self.pending_queue.pop(beginning_fragment, unordered) {
             // Mark all fragements are in-flight now
             if c.ending_fragment {
                 c.set_all_inflight();
@@ -1864,7 +1864,6 @@ impl AssociationInternal {
                 if self
                     .pending_queue
                     .pop(beginning_fragment, unordered)
-                    .await
                     .is_none()
                 {
                     log::error!("failed to pop from pending queue");
