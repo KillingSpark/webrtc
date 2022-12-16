@@ -104,6 +104,8 @@ fn main() -> Result<(), Error> {
             })
     });
 
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
     std::thread::spawn(|| {
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -146,6 +148,6 @@ fn main() -> Result<(), Error> {
                 }
                 Result::<(), Error>::Ok(())
             })
-    });
-    loop {}
+    }).join().unwrap().unwrap();
+    Ok(())
 }
