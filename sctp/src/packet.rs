@@ -80,6 +80,188 @@ impl fmt::Display for Packet {
 
 pub(crate) const PACKET_HEADER_SIZE: usize = 12;
 
+/// Precompute a CRC lookup table for up to LEVEL steps
+const fn crc32_lookup_table<const LEVEL: usize>(poly: u32) -> [[u32; 256]; LEVEL] {
+    // compute the crc for one byte by doing the slow bitwise calculation
+    const fn crc(value: u8, poly: u32) -> u32 {
+        let mut crc = value as u32;
+        let mut i = 0;
+        while i < 8 {
+            let has_lowest_bit = crc & 1;
+            crc = (crc >> 1) ^ (has_lowest_bit * poly);
+            i += 1;
+        }
+        crc
+    }
+
+    let poly = poly.reverse_bits();
+    let mut table = [[0u32; 256]; LEVEL];
+    let mut i = 0;
+    while i < 256 {
+        table[0][i] = crc(i as u8, poly);
+        i += 1;
+    }
+
+    i = 0;
+    while i < 256 {
+        let mut level = 1;
+        while level < LEVEL {
+            let previous_level = table[level - 1][i];
+            table[level][i] =
+                (table[level - 1][i] >> 8) ^ table[0][(previous_level & 0xFF) as usize];
+            level += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Precomputed lookup table for up to 16 steps
+const ISCSI_TABLE: [[u32; 256]; 16] = crc32_lookup_table(0x1EDC6F41);
+
+//calc the crc one byte at a time
+const fn crc(mut crc: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i < data.len() {
+        let lookup_idx = (crc ^ (data[i] as u32)) & 0xFF;
+        crc = (crc >> 8) ^ ISCSI_TABLE[0][lookup_idx as usize];
+        i += 1;
+    }
+    !crc
+}
+
+// adapted from https://create.stephan-brumme.com/crc32/#slicing-by-16-overview
+// this specific alg was submitted to this author by Bulat Ziganshin
+const fn crc_slice_16(mut crc: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+
+    // crc for 16 bytes in one iteration
+    while i + 16 < data.len() {
+        let first = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let first = first ^ crc;
+        i += 4;
+        let second = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        i += 4;
+        let third = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        i += 4;
+        let fourth = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        i += 4;
+        crc = ISCSI_TABLE[0][((fourth >> 24) & 0xFF) as usize]
+            ^ ISCSI_TABLE[1][((fourth >> 16) & 0xFF) as usize]
+            ^ ISCSI_TABLE[2][((fourth >> 8) & 0xFF) as usize]
+            ^ ISCSI_TABLE[3][((fourth >> 0) & 0xFF) as usize]
+            ^ ISCSI_TABLE[4][((third >> 24) & 0xFF) as usize]
+            ^ ISCSI_TABLE[5][((third >> 16) & 0xFF) as usize]
+            ^ ISCSI_TABLE[6][((third >> 8) & 0xFF) as usize]
+            ^ ISCSI_TABLE[7][((third >> 0) & 0xFF) as usize]
+            ^ ISCSI_TABLE[8][((second >> 24) & 0xFF) as usize]
+            ^ ISCSI_TABLE[9][((second >> 16) & 0xFF) as usize]
+            ^ ISCSI_TABLE[10][((second >> 8) & 0xFF) as usize]
+            ^ ISCSI_TABLE[11][((second >> 0) & 0xFF) as usize]
+            ^ ISCSI_TABLE[12][((first >> 24) & 0xFF) as usize]
+            ^ ISCSI_TABLE[13][((first >> 16) & 0xFF) as usize]
+            ^ ISCSI_TABLE[14][((first >> 8) & 0xFF) as usize]
+            ^ ISCSI_TABLE[15][((first >> 0) & 0xFF) as usize];
+    }
+    // crc for the remaining <= 15 bytes
+    while i < data.len() {
+        let lookup_idx = (crc ^ (data[i] as u32)) & 0xFF;
+        crc = (crc >> 8) ^ ISCSI_TABLE[0][lookup_idx as usize];
+        i += 1;
+    }
+    crc
+}
+
+//iSCSI CRC32 algorithm parameters {
+//    width: 32,
+//    poly: 0x1edc6f41,
+//    init: 0xffffffff,
+//    refin: true,
+//    refout: true,
+//    xorout: 0xffffffff,
+//    check: 0xe3069283,
+//    residue: 0xb798b438,
+//};
+
+/// Optimized iSCSI CRC32 digester
+struct IscsiDigest {
+    crc: u32,
+}
+
+impl IscsiDigest {
+    /// Digest on byte slice all at once
+    const fn digest(data: &[u8]) -> u32 {
+        !crc_slice_16(0xFFFFFFFF, data)
+    }
+
+    /// New digester that can handle multiple slices
+    fn new() -> Self {
+        Self { crc: 0xFFFFFFFF }
+    }
+
+    /// Feed data to this digest
+    fn update(&mut self, data: &[u8]) {
+        self.crc = crc_slice_16(self.crc, data);
+    }
+
+    /// Get the crc for the data that has been fed into the digest
+    fn finish(self) -> u32 {
+        !self.crc
+    }
+}
+
+#[test]
+fn crc_impl() {
+    for x in 0..10000 {
+        let d = format!("{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}{x}");
+
+        let mut digest = ISCSI_CRC.digest();
+        digest.update(d.as_bytes());
+        let their_crc = digest.finalize();
+        let mut digest = IscsiDigest::new();
+        digest.update(d.as_bytes());
+        let my_crc = digest.finish();
+        assert_eq!(my_crc, their_crc, "CRC for {d:X?} did not match");
+
+        let b = d.as_bytes();
+        let b1 = &b[..b.len() / 2];
+        let b2 = &b[b.len() / 2..];
+        let mut digest = ISCSI_CRC.digest();
+        digest.update(b1);
+        digest.update(b2);
+        let their_crc2 = digest.finalize();
+        let mut digest = IscsiDigest::new();
+        digest.update(b1);
+        digest.update(b2);
+        let my_crc2 = digest.finish();
+
+        assert_eq!(my_crc2, my_crc, "CRC for {d:X?} did not match");
+        assert_eq!(my_crc2, their_crc2, "CRC for {d:X?} did not match");
+    }
+}
+
+#[test]
+fn crc_example() {
+    let packet = [
+        19, 136, 19, 136, 0, 0, 0, 0, 1, 86, 122, 23, 1, 0, 0, 26, 230, 175, 86, 132, 0, 16, 0, 0,
+        255, 255, 255, 255, 188, 125, 251, 250, 128, 8, 0, 6, 130, 192, 0, 0,
+    ];
+
+    let mut digest = IscsiDigest::new();
+    digest.update(&packet[0..8]);
+    digest.update(&[0, 0, 0, 0]);
+    digest.update(&packet[12..]);
+    let recv = digest.finish();
+
+    let packet_with_zeroed_checksum = [
+        19, 136, 19, 136, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 26, 230, 175, 86, 132, 0, 16, 0, 0, 255,
+        255, 255, 255, 188, 125, 251, 250, 128, 8, 0, 6, 130, 192, 0, 0,
+    ];
+    let send = IscsiDigest::digest(&packet_with_zeroed_checksum);
+
+    assert_eq!(recv, send);
+}
+
 impl Packet {
     pub(crate) fn unmarshal(raw: &Bytes) -> Result<Self> {
         if raw.len() < PACKET_HEADER_SIZE {
@@ -96,13 +278,16 @@ impl Packet {
         // only check for checksums when we are not fuzzing. This lets the fuzzer test the code much easier without guessing correct checksums.
         {
             let their_checksum = reader.get_u32_le();
-            let our_checksum = generate_packet_checksum(raw);
+            let mut digest = IscsiDigest::new();
+            digest.update(&raw[0..8]);
+            digest.update(&[0, 0, 0, 0]);
+            digest.update(&raw[12..]);
+            let our_checksum = digest.finish();
 
             if their_checksum != our_checksum {
                 return Err(Error::ErrChecksumMismatch);
             }
         }
-
         let mut chunks = vec![];
         let mut offset = PACKET_HEADER_SIZE;
         loop {
@@ -169,9 +354,7 @@ impl Packet {
             }
         }
 
-        let mut digest = ISCSI_CRC.digest();
-        digest.update(writer);
-        let checksum = digest.finalize();
+        let checksum = IscsiDigest::digest(writer.as_ref());
 
         // Checksum is already in BigEndian
         // Using LittleEndian stops it from being flipped
